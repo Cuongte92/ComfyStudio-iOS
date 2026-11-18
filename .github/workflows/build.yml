@@ -23,6 +23,11 @@ jobs:
         run: |
           git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git sd_cpp
           cd sd_cpp
+
+          # Vá lỗi BUNDLE DESTINATION khi cross-compile iOS và vô hiệu hóa build sd-server
+          sed -i '' 's/RUNTIME DESTINATION bin/RUNTIME DESTINATION bin BUNDLE DESTINATION bin/g' examples/cli/CMakeLists.txt
+          sed -i '' 's/add_subdirectory(server)/# add_subdirectory(server)/g' examples/CMakeLists.txt
+
           mkdir build_ios && cd build_ios
 
           cmake .. \
@@ -36,7 +41,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_BUILD_TYPE=Release
 
-          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+          cmake --build . --target sd-cli --config Release -j$(sysctl -n hw.ncpu)
 
           # Gom tất cả file .o của target sd-cli (bao gồm main.cpp.o và examples/common/*.o)
           mkdir -p cli_objs
