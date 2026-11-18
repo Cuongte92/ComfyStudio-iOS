@@ -397,6 +397,8 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_CXX_STANDARD=17 \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DgRPC_INSTALL=OFF \
             -DgRPC_BUILD_TESTS=OFF \
             -DgRPC_BUILD_CODEGEN=OFF \
