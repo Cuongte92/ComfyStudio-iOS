@@ -31,6 +31,9 @@ struct ComfyHybridWebView: UIViewRepresentable {
         cc.add(context.coordinator, name: "importLocalModelHandler")
         cc.add(context.coordinator, name: "generateLocalHandler")
         cc.add(context.coordinator, name: "cancelLocalHandler")
+        cc.add(context.coordinator, name: "connectDTGrpcHandler")
+        cc.add(context.coordinator, name: "generateDTGrpcHandler")
+        cc.add(context.coordinator, name: "cancelDTGrpcHandler")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         context.coordinator.webView = webView
@@ -56,6 +59,9 @@ struct ComfyHybridWebView: UIViewRepresentable {
         cc.removeScriptMessageHandler(forName: "importLocalModelHandler")
         cc.removeScriptMessageHandler(forName: "generateLocalHandler")
         cc.removeScriptMessageHandler(forName: "cancelLocalHandler")
+        cc.removeScriptMessageHandler(forName: "connectDTGrpcHandler")
+        cc.removeScriptMessageHandler(forName: "generateDTGrpcHandler")
+        cc.removeScriptMessageHandler(forName: "cancelDTGrpcHandler")
     }
 
     class Coordinator: NSObject, WKScriptMessageHandler, WKUIDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate {
@@ -104,6 +110,32 @@ struct ComfyHybridWebView: UIViewRepresentable {
 
             case "cancelLocalHandler":
                 SDWrapper.shared().cancelGeneration()
+
+            case "connectDTGrpcHandler":
+                if let params = message.body as? [String: Any],
+                   let endpoint = params["endpoint"] as? String {
+                    let useTLS = (params["useTLS"] as? Bool) ?? false
+                    SDWrapper.shared().connectDrawThingsGRPC(endpoint, useTLS: useTLS) { success, models, loras, err in
+                        let payload: [String: Any] = [
+                            "success": success,
+                            "models": models ?? [],
+                            "loras": loras ?? [],
+                            "error": err ?? ""
+                        ]
+                        if let jsonData = try? JSONSerialization.data(withJSONObject: payload),
+                           let jsonStr = String(data: jsonData, encoding: .utf8) {
+                            self.webView?.evaluateJavaScript("window.onDTGrpcConnected(\(jsonStr));", completionHandler: nil)
+                        }
+                    }
+                }
+
+            case "generateDTGrpcHandler":
+                if let params = message.body as? [String: Any] {
+                    self.runDTGrpcGeneration(params: params)
+                }
+
+            case "cancelDTGrpcHandler":
+                SDWrapper.shared().cancelDrawThingsGRPC()
 
             case "saveImageHandler":
                 if let dataUrl = message.body as? String {
@@ -213,6 +245,60 @@ struct ComfyHybridWebView: UIViewRepresentable {
             )
         }
 
+        private func runDTGrpcGeneration(params: [String: Any]) {
+            guard let endpoint = params["endpoint"] as? String, !endpoint.isEmpty else {
+                self.webView?.evaluateJavaScript("window.onLocalGenError('Chưa nhập địa chỉ Draw Things gRPC Server!');", completionHandler: nil)
+                return
+            }
+            guard let modelName = params["modelName"] as? String, !modelName.isEmpty else {
+                self.webView?.evaluateJavaScript("window.onLocalGenError('Chưa chọn Model trên Draw Things Server!');", completionHandler: nil)
+                return
+            }
+
+            let useTLS = (params["useTLS"] as? Bool) ?? false
+            let loraName = params["loraName"] as? String
+            let loraStrength = (params["loraStrength"] as? NSNumber)?.floatValue ?? 0.85
+            let prompt = params["prompt"] as? String ?? ""
+            let negativePrompt = params["negativePrompt"] as? String ?? ""
+            let width = (params["width"] as? NSNumber)?.int32Value ?? 1024
+            let height = (params["height"] as? NSNumber)?.int32Value ?? 1024
+            let steps = (params["steps"] as? NSNumber)?.int32Value ?? 12
+            let cfg = (params["cfg"] as? NSNumber)?.floatValue ?? 3.5
+            let seed = (params["seed"] as? NSNumber)?.int64Value ?? 42
+            let initImage = params["initImage"] as? String
+            let maskImage = params["maskImage"] as? String
+            let denoise = (params["denoise"] as? NSNumber)?.floatValue ?? 0.75
+
+            SDWrapper.shared().generateWithDrawThingsGRPC(
+                endpoint,
+                useTLS: useTLS,
+                modelName: modelName,
+                loraName: (loraName == "None" || loraName == "") ? nil : loraName,
+                loraStrength: loraStrength,
+                prompt: prompt,
+                negativePrompt: negativePrompt,
+                width: width,
+                height: height,
+                steps: steps,
+                cfgScale: cfg,
+                seed: seed,
+                initImageBase64: initImage,
+                maskImageBase64: maskImage,
+                denoise: denoise,
+                progress: { step, totalSteps, elapsed in
+                    self.webView?.evaluateJavaScript("window.onDTGrpcProgress(\(step), \(totalSteps), \(elapsed));", completionHandler: nil)
+                },
+                completion: { base64Png, errorMsg in
+                    if let err = errorMsg {
+                        let safeErr = err.replacingOccurrences(of: "'", with: "\\'")
+                        self.webView?.evaluateJavaScript("window.onLocalGenError('\(safeErr)');", completionHandler: nil)
+                    } else if let b64 = base64Png {
+                        self.webView?.evaluateJavaScript("window.onDTGrpcComplete('\(b64)');", completionHandler: nil)
+                    }
+                }
+            )
+        }
+
         private func showImageSourceSheet() {
             let sheet = UIAlertController(title: "Chọn ảnh nguồn", message: nil, preferredStyle: .actionSheet)
             sheet.addAction(UIAlertAction(title: "Thư viện ảnh (Photo Library)", style: .default) { _ in
@@ -298,7 +384,7 @@ let embeddedHybridHTML = #"""
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-    <title>ComfyStudio Hybrid — A19 Pro Metal & Cloud</title>
+    <title>ComfyStudio Tri-Engine — A19 Pro, Colab & DrawThings gRPC</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -342,7 +428,6 @@ let embeddedHybridHTML = #"""
 
     <div id="toast-container" class="fixed top-3 right-3 left-3 sm:left-auto sm:w-96 z-50 flex flex-col gap-2 pointer-events-none"></div>
 
-    <!-- Vòng tròn preview cỡ cọ giữa màn hình -->
     <div id="brush-preview-overlay" class="fixed inset-0 pointer-events-none z-40 flex items-center justify-center hidden">
       <div id="brush-preview-circle" class="rounded-full border-2 border-rose-400 bg-rose-500/30 shadow-lg"></div>
     </div>
@@ -358,14 +443,15 @@ let embeddedHybridHTML = #"""
                 <span class="font-bold tracking-tight text-white text-sm">ComfyStudio</span>
                 <span id="header-engine-badge" class="text-[9px] font-mono uppercase bg-emerald-950 text-emerald-300 px-1.5 py-0.5 rounded border border-emerald-700/60">A19 Pro Metal</span>
               </div>
-              <div class="text-[10px] text-zinc-400">Dual Engine · Offline & Tunnel</div>
+              <div class="text-[10px] text-zinc-400">Tri-Engine · Local, Colab & DT gRPC</div>
             </div>
           </div>
 
-          <!-- Bộ chuyển Engine: Local iPhone vs Colab Server -->
+          <!-- Bộ chuyển 3 Engine -->
           <div class="flex items-center bg-zinc-900 p-1 rounded-xl border border-white/10 text-xs">
-            <button id="engine-local-btn" type="button" class="px-2.5 py-1 rounded-lg font-semibold bg-emerald-600 text-white shadow transition">📱 Local</button>
-            <button id="engine-cloud-btn" type="button" class="px-2.5 py-1 rounded-lg font-medium text-zinc-400 hover:text-white transition">☁️ Colab</button>
+            <button id="engine-local-btn" type="button" class="px-2 py-1 rounded-lg font-semibold bg-emerald-600 text-white shadow transition">📱 Local</button>
+            <button id="engine-cloud-btn" type="button" class="px-2 py-1 rounded-lg font-medium text-zinc-400 hover:text-white transition">☁️ Colab</button>
+            <button id="engine-grpc-btn" type="button" class="px-2 py-1 rounded-lg font-medium text-zinc-400 hover:text-white transition">🔌 DT gRPC</button>
           </div>
         </div>
 
@@ -392,6 +478,25 @@ let embeddedHybridHTML = #"""
             <span id="connect-text">Kết nối</span>
           </button>
         </div>
+
+        <!-- Thanh công cụ Engine Draw Things gRPC -->
+        <div id="grpc-header-bar" class="hidden flex items-center gap-1.5 w-full sm:max-w-xl">
+          <div class="relative flex-1">
+            <input id="grpc-endpoint-input" type="text" class="w-full bg-zinc-900/90 border border-amber-600/50 rounded-xl pl-3 pr-28 py-1.5 text-zinc-200 placeholder-zinc-500 font-mono focus:outline-none focus:ring-1 focus:ring-amber-500" placeholder="host.pinggy.link:port" />
+            <div class="absolute inset-y-0 right-1.5 flex items-center gap-1.5">
+              <label class="flex items-center gap-1 text-[10px] text-zinc-300 bg-zinc-800 px-1.5 py-1 rounded-lg border border-zinc-700 cursor-pointer">
+                <input id="grpc-tls-check" type="checkbox" class="w-3 h-3 accent-amber-500">
+                <span>TLS</span>
+              </label>
+              <button id="btn-paste-grpc" type="button" class="px-1.5 py-1 text-[10px] bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg border border-zinc-700">📋</button>
+              <span id="grpc-status-dot" class="w-2.5 h-2.5 rounded-full bg-zinc-500"></span>
+            </div>
+          </div>
+          <button id="btn-connect-grpc" type="button" class="flex items-center gap-1 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold px-3.5 py-2 rounded-xl shadow-md transition whitespace-nowrap">
+            <svg id="grpc-connect-spinner" class="w-3.5 h-3.5 animate-spin hidden" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
+            <span id="grpc-connect-text">Echo</span>
+          </button>
+        </div>
       </div>
     </header>
 
@@ -411,14 +516,13 @@ let embeddedHybridHTML = #"""
           </div>
         </div>
 
-        <!-- Khối Ảnh Nguồn (I2I / Depth / Inpaint) -->
+        <!-- Khối Ảnh Nguồn -->
         <div id="source-image-panel" class="hidden glass-panel rounded-2xl p-3.5 space-y-2.5 border-indigo-500/30">
           <div class="flex items-center justify-between">
             <span id="source-panel-title" class="text-xs font-semibold text-indigo-300">Ảnh Nguồn (Reference Image)</span>
             <button id="btn-pick-source-image" type="button" class="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium shadow">🖼️ Chọn Ảnh iPhone</button>
           </div>
 
-          <!-- Denoise cho I2I / Inpaint -->
           <div id="denoise-box" class="pt-1 border-t border-white/10">
             <div class="flex items-center justify-between mb-1 text-xs">
               <span class="text-zinc-300">Mức độ vẽ lại (Denoise):</span>
@@ -427,7 +531,6 @@ let embeddedHybridHTML = #"""
             <input id="denoise-slider" type="range" min="0.1" max="1.0" step="0.05" value="0.75" class="w-full accent-indigo-500 h-1.5">
           </div>
 
-          <!-- Depth ControlNet (Chỉ dùng cho Colab) -->
           <div id="depth-settings-box" class="hidden pt-1 border-t border-white/10 space-y-2">
             <div>
               <label class="block text-[11px] text-zinc-400 mb-1">ControlNet Depth Model (Colab):</label>
@@ -458,7 +561,6 @@ let embeddedHybridHTML = #"""
             </select>
           </div>
 
-          <!-- LoRA -->
           <div class="bg-zinc-950/70 p-3 rounded-xl border border-white/5 space-y-2 text-xs">
             <div class="flex items-center justify-between">
               <label class="flex items-center gap-2 cursor-pointer font-semibold text-zinc-200">
@@ -485,7 +587,6 @@ let embeddedHybridHTML = #"""
           </div>
           <textarea id="positive-prompt" rows="3" class="w-full bg-zinc-950/90 border border-zinc-700 rounded-xl p-2.5 text-zinc-100 leading-relaxed" placeholder="Mô tả ảnh muốn tạo...">masterpiece, best quality, ultra-detailed cinematic portrait of a handsome athletic man, natural skin texture, volumetric studio lighting, 8k raw photo</textarea>
 
-          <!-- Prompt Chips -->
           <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
             <button type="button" class="tag-chip bg-zinc-800/90 text-rose-300 px-2 py-0.5 rounded-lg border border-rose-800/60" data-tag="fixing his fingers, anatomically correct male hands, detailed five fingers, realistic palms">Sửa Ngón Tay</button>
             <button type="button" class="tag-chip bg-zinc-800/90 text-zinc-200 px-2 py-0.5 rounded-lg" data-tag="muscular athletic build, defined pectorals, six-pack abs">Cơ Bắp</button>
@@ -494,7 +595,7 @@ let embeddedHybridHTML = #"""
 
           <div id="negative-prompt-container" class="pt-1">
             <div class="flex items-center justify-between mb-1 text-xs">
-              <label class="font-medium text-rose-400">Negative Prompt (SDXL)</label>
+              <label class="font-medium text-rose-400">Negative Prompt</label>
               <button id="btn-clear-negative" type="button" class="text-[11px] text-zinc-400 hover:text-zinc-200">Xóa</button>
             </div>
             <textarea id="negative-prompt" rows="2" class="w-full bg-zinc-950/90 border border-zinc-700 rounded-xl p-2 text-zinc-100">blurry, low quality, worst quality, distorted anatomy, bad hands, mutated fingers, extra limbs, watermark</textarea>
@@ -518,7 +619,6 @@ let embeddedHybridHTML = #"""
             <input id="input-height" type="number" step="64" value="1024" class="w-full bg-zinc-950/90 border border-zinc-700 rounded-xl p-1.5 text-center font-mono">
           </div>
 
-          <!-- Batch Size (Chỉ bật khi ở chế độ Colab) -->
           <div id="cloud-batch-box" class="hidden bg-zinc-950/70 p-2.5 rounded-xl border border-white/5 text-xs">
             <div class="flex items-center justify-between">
               <span class="font-medium text-zinc-300">Số Lượng Ảnh (Batch Colab)</span>
@@ -585,7 +685,6 @@ let embeddedHybridHTML = #"""
             </div>
           </div>
 
-          <!-- Thanh cọ Inpaint -->
           <div id="brush-toolbar" class="hidden flex-wrap items-center justify-between px-3 py-2 bg-zinc-950/90 border-b border-white/10 text-xs gap-2">
             <div class="flex items-center bg-zinc-900 p-0.5 rounded-xl border border-zinc-800">
               <button id="btn-brush-mode" type="button" class="px-3 py-1 rounded-lg font-medium bg-rose-600 text-white">🖌️ Tô</button>
@@ -603,7 +702,7 @@ let embeddedHybridHTML = #"""
             <div id="canvas-empty-state" class="flex flex-col items-center justify-center text-center p-6 max-w-xs text-zinc-500">
               <div class="w-14 h-14 rounded-2xl bg-zinc-900/90 border border-white/10 flex items-center justify-center text-2xl mb-3">🎨</div>
               <p class="text-xs text-zinc-300 font-semibold">Chưa có ảnh trên Canvas</p>
-              <p class="text-[11px] mt-1 text-zinc-500">Dùng Local iPhone (SDXL offline) hoặc chuyển sang tab Colab để chạy Flux 2 / SDXL Server.</p>
+              <p class="text-[11px] mt-1 text-zinc-500">Hỗ trợ Local A19 Pro Metal, Colab ComfyUI và Draw Things gRPC Server.</p>
             </div>
 
             <div id="canvas-generating-overlay" class="absolute inset-0 bg-zinc-950/80 backdrop-blur-sm flex flex-col items-center justify-center gap-2.5 z-20 hidden">
@@ -626,7 +725,6 @@ let embeddedHybridHTML = #"""
           </div>
         </div>
 
-        <!-- Session Gallery -->
         <div class="glass-panel rounded-2xl p-3">
           <div class="flex items-center justify-between text-xs mb-2">
             <span class="font-semibold text-zinc-300">Lịch sử ảnh trong phiên</span>
@@ -645,8 +743,10 @@ let embeddedHybridHTML = #"""
 
     <script>
       const state = {
-        engine: 'local', // 'local' hoặc 'cloud'
+        engine: 'local', // 'local', 'cloud', 'grpc'
         serverUrl: localStorage.getItem('comfystudio_tunnel_url') || '',
+        grpcEndpoint: localStorage.getItem('comfystudio_dt_grpc') || '',
+        grpcUseTLS: localStorage.getItem('comfystudio_dt_tls') === 'true',
         clientId: crypto.randomUUID ? crypto.randomUUID() : ('client_' + Math.random().toString(36).substring(2, 10)),
         ws: null,
         reconnectTimer: null,
@@ -664,6 +764,8 @@ let embeddedHybridHTML = #"""
         localModels: [],
         localLoras: [],
         cloudModels: { checkpoints: [], unets: [], clips: [], vaes: [], loras: [], controlnets: [] },
+        grpcModels: [],
+        grpcLoras: [],
 
         gallery: [],
         startTime: null,
@@ -673,15 +775,26 @@ let embeddedHybridHTML = #"""
       const el = {
         engineLocalBtn: document.getElementById('engine-local-btn'),
         engineCloudBtn: document.getElementById('engine-cloud-btn'),
+        engineGrpcBtn: document.getElementById('engine-grpc-btn'),
         headerEngineBadge: document.getElementById('header-engine-badge'),
         localHeaderBar: document.getElementById('local-header-bar'),
         cloudHeaderBar: document.getElementById('cloud-header-bar'),
+        grpcHeaderBar: document.getElementById('grpc-header-bar'),
+
         serverUrlInput: document.getElementById('server-url-input'),
         btnPasteUrl: document.getElementById('btn-paste-url'),
         btnConnect: document.getElementById('btn-connect'),
         connectSpinner: document.getElementById('connect-spinner'),
         connectText: document.getElementById('connect-text'),
         connectionStatusDot: document.getElementById('connection-status-dot'),
+
+        grpcEndpointInput: document.getElementById('grpc-endpoint-input'),
+        grpcTlsCheck: document.getElementById('grpc-tls-check'),
+        btnPasteGrpc: document.getElementById('btn-paste-grpc'),
+        btnConnectGrpc: document.getElementById('btn-connect-grpc'),
+        grpcConnectSpinner: document.getElementById('grpc-connect-spinner'),
+        grpcConnectText: document.getElementById('grpc-connect-text'),
+        grpcStatusDot: document.getElementById('grpc-status-dot'),
 
         btnImportModel: document.getElementById('btn-import-model'),
         btnScanLocal: document.getElementById('btn-scan-local'),
@@ -767,34 +880,125 @@ let embeddedHybridHTML = #"""
         return u;
       }
 
-      // === CHUYỂN ĐỔI ENGINE LOCAL <-> COLAB ===
+      function sanitizeHostPort(raw) {
+        if (!raw) return '';
+        return raw.trim().replace(/^tcp:\/\//i, '').replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+      }
+
+      // === CHUYỂN ĐỔI 3 ENGINE ===
       function switchEngine(target) {
         state.engine = target;
+        const inactiveBtn = 'px-2 py-1 rounded-lg font-medium text-zinc-400 hover:text-white transition';
+        el.engineLocalBtn.className = inactiveBtn;
+        el.engineCloudBtn.className = inactiveBtn;
+        el.engineGrpcBtn.className = inactiveBtn;
+
+        el.localHeaderBar.classList.add('hidden');
+        el.cloudHeaderBar.classList.add('hidden');
+        el.grpcHeaderBar.classList.add('hidden');
+        el.cloudBatchBox.classList.add('hidden');
+
         if (target === 'local') {
-          el.engineLocalBtn.className = 'px-2.5 py-1 rounded-lg font-semibold bg-emerald-600 text-white shadow transition';
-          el.engineCloudBtn.className = 'px-2.5 py-1 rounded-lg font-medium text-zinc-400 hover:text-white transition';
+          el.engineLocalBtn.className = 'px-2 py-1 rounded-lg font-semibold bg-emerald-600 text-white shadow transition';
           el.headerEngineBadge.textContent = 'A19 Pro Metal';
           el.headerEngineBadge.className = 'text-[9px] font-mono uppercase bg-emerald-950 text-emerald-300 px-1.5 py-0.5 rounded border border-emerald-700/60';
           el.localHeaderBar.classList.remove('hidden');
-          el.cloudHeaderBar.classList.add('hidden');
-          el.cloudBatchBox.classList.add('hidden');
           el.btnGenerate.className = 'flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-bold py-3.5 px-4 rounded-2xl shadow-lg transition active:scale-[0.98] text-sm';
           el.generateBtnText.textContent = '⚡ Tạo Ảnh Offline (A19 Pro)';
           el.archBadge.textContent = 'SDXL Metal';
           populateLocalDropdowns();
-        } else {
-          el.engineCloudBtn.className = 'px-2.5 py-1 rounded-lg font-semibold bg-indigo-600 text-white shadow transition';
-          el.engineLocalBtn.className = 'px-2.5 py-1 rounded-lg font-medium text-zinc-400 hover:text-white transition';
+        } else if (target === 'cloud') {
+          el.engineCloudBtn.className = 'px-2 py-1 rounded-lg font-semibold bg-indigo-600 text-white shadow transition';
           el.headerEngineBadge.textContent = 'Colab Tunnel';
           el.headerEngineBadge.className = 'text-[9px] font-mono uppercase bg-indigo-950 text-indigo-300 px-1.5 py-0.5 rounded border border-indigo-700/60';
-          el.localHeaderBar.classList.add('hidden');
           el.cloudHeaderBar.classList.remove('hidden');
           el.cloudBatchBox.classList.remove('hidden');
           el.btnGenerate.className = 'flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-bold py-3.5 px-4 rounded-2xl shadow-lg transition active:scale-[0.98] text-sm';
           el.generateBtnText.textContent = '☁️ Tạo Ảnh Trên Colab';
           populateCloudDropdowns();
+        } else {
+          el.engineGrpcBtn.className = 'px-2 py-1 rounded-lg font-semibold bg-amber-600 text-white shadow transition';
+          el.headerEngineBadge.textContent = 'DrawThings gRPC';
+          el.headerEngineBadge.className = 'text-[9px] font-mono uppercase bg-amber-950 text-amber-300 px-1.5 py-0.5 rounded border border-amber-700/60';
+          el.grpcHeaderBar.classList.remove('hidden');
+          el.btnGenerate.className = 'flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-amber-600 to-orange-600 text-white font-bold py-3.5 px-4 rounded-2xl shadow-lg transition active:scale-[0.98] text-sm';
+          el.generateBtnText.textContent = '🔌 Tạo Ảnh Qua DT gRPC';
+          populateGrpcDropdowns();
         }
       }
+
+      // === DRAW THINGS GRPC ENGINE ===
+      function connectDrawThingsServer() {
+        const ep = sanitizeHostPort(el.grpcEndpointInput.value);
+        if (!ep) return showToast('Nhập địa chỉ host:port của Pinggy/ngrok!', 'error');
+        const tls = el.grpcTlsCheck.checked;
+        state.grpcEndpoint = ep;
+        state.grpcUseTLS = tls;
+        localStorage.setItem('comfystudio_dt_grpc', ep);
+        localStorage.setItem('comfystudio_dt_tls', tls ? 'true' : 'false');
+
+        el.grpcConnectSpinner.classList.remove('hidden');
+        el.btnConnectGrpc.disabled = true;
+        el.grpcConnectText.textContent = 'Ping...';
+
+        window.webkit?.messageHandlers?.connectDTGrpcHandler?.postMessage({ endpoint: ep, useTLS: tls });
+      }
+
+      window.onDTGrpcConnected = function(data) {
+        el.grpcConnectSpinner.classList.add('hidden');
+        el.btnConnectGrpc.disabled = false;
+        el.grpcConnectText.textContent = 'Echo';
+
+        if (!data.success) {
+          el.grpcStatusDot.className = 'w-2.5 h-2.5 rounded-full bg-rose-500';
+          return showToast(data.error || 'Không kết nối được Draw Things gRPC!', 'error');
+        }
+
+        el.grpcStatusDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500';
+        state.grpcModels = data.models || [];
+        state.grpcLoras = data.loras || [];
+        if (state.engine === 'grpc') populateGrpcDropdowns();
+        showToast(`Kết nối Draw Things Server thành công (${state.grpcModels.length} model)!`, 'success');
+      };
+
+      function populateGrpcDropdowns() {
+        el.selectCheckpoint.innerHTML = '';
+        if (state.grpcModels.length === 0) {
+          el.selectCheckpoint.innerHTML = '<option value="qwen_image_2.1_q8p.ckpt">qwen_image_2.1_q8p.ckpt (Mặc định Colab)</option>';
+        } else {
+          state.grpcModels.forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m; opt.textContent = m;
+            el.selectCheckpoint.appendChild(opt);
+          });
+        }
+        el.selectLora.innerHTML = '<option value="None">None</option>';
+        state.grpcLoras.forEach(l => {
+          const opt = document.createElement('option');
+          opt.value = l; opt.textContent = l;
+          el.selectLora.appendChild(opt);
+        });
+        onModelSelectionChange();
+      }
+
+      window.onDTGrpcProgress = function(step, totalSteps) {
+        const pct = Math.min(99, Math.round((step / Math.max(1, totalSteps)) * 100));
+        el.progressFill.style.width = `${pct}%`;
+        el.progressPercentage.textContent = `${pct}%`;
+        el.stepLabel.textContent = `Draw Things gRPC · Step ${step}/${totalSteps}`;
+      };
+
+      window.onDTGrpcComplete = function(base64Png) {
+        addGalleryThumb(base64Png);
+        const im = new Image();
+        im.onload = () => syncCanvasWithImage(im);
+        im.src = base64Png;
+        stopGenUI();
+        el.progressFill.style.width = '100%';
+        el.progressPercentage.textContent = '100%';
+        el.stepLabel.textContent = 'Hoàn tất từ Draw Things Server!';
+        showToast('Đã nhận ảnh từ Draw Things gRPC!', 'success');
+      };
 
       // === LOCAL ENGINE CALLBACKS ===
       window.receiveLocalModelsList = function(data) {
@@ -847,23 +1051,28 @@ let embeddedHybridHTML = #"""
         showToast(errMsg, 'error');
       };
 
-      // === COLAB CLOUD ENGINE ===
-      function identifyCloudArch(modelName) {
-        if ((modelName || '').toLowerCase().includes('flux')) {
+      // === MODEL PRESET AUTO-TUNE ===
+      function identifyArch(modelName) {
+        const lower = (modelName || '').toLowerCase();
+        if (lower.includes('qwen')) {
+          return { type: 'qwen', badge: 'Qwen Image 2.1', steps: 12, cfg: 3.5 };
+        }
+        if (lower.includes('flux')) {
           return { type: 'flux2', badge: 'Flux 2 Klein (FP8)', steps: 4, cfg: 1.0 };
         }
-        return { type: 'sdxl', badge: 'SDXL Cloud', steps: 28, cfg: 7.0 };
+        return { type: 'sdxl', badge: state.engine === 'grpc' ? 'SDXL gRPC' : 'SDXL Cloud', steps: 25, cfg: 6.5 };
       }
 
-      function onCloudModelChange() {
-        if (state.engine !== 'cloud') return;
-        const arch = identifyCloudArch(el.selectCheckpoint.value);
+      function onModelSelectionChange() {
+        if (state.engine === 'local') return;
+        const arch = identifyArch(el.selectCheckpoint.value);
         el.archBadge.textContent = arch.badge;
         el.sliderSteps.value = arch.steps; el.stepsVal.textContent = arch.steps;
         el.sliderCfg.value = arch.cfg; el.cfgVal.textContent = arch.cfg.toFixed(1);
         el.negativePromptContainer.classList.toggle('opacity-40', arch.type === 'flux2');
       }
 
+      // === COLAB CLOUD ENGINE ===
       async function connectCloudServer() {
         const url = sanitizeUrl(el.serverUrlInput.value);
         if (!url) return showToast('Vui lòng nhập link Cloudflare Tunnel!', 'error');
@@ -924,7 +1133,7 @@ let embeddedHybridHTML = #"""
           if (c.toLowerCase().includes('depth')) opt.selected = true;
           el.selectControlnet.appendChild(opt);
         });
-        onCloudModelChange();
+        onModelSelectionChange();
       }
 
       async function uploadCloudImages(includeMask) {
@@ -948,7 +1157,7 @@ let embeddedHybridHTML = #"""
       async function executeCloudGeneration() {
         const activeModel = el.selectCheckpoint.value;
         if (!activeModel) throw new Error('Chưa chọn Model trên Colab!');
-        const arch = identifyCloudArch(activeModel);
+        const arch = identifyArch(activeModel);
         const width = parseInt(el.inputWidth.value) || 1024;
         const height = parseInt(el.inputHeight.value) || 1024;
         const steps = parseInt(el.sliderSteps.value) || 4;
@@ -1100,7 +1309,7 @@ let embeddedHybridHTML = #"""
         };
       }
 
-      // === CHUNG CHO CẢ 2 ENGINE ===
+      // === CHUNG CHO CẢ 3 ENGINE ===
       function syncCanvasWithImage(img) {
         state.baseImageObj = img;
         const w = img.naturalWidth || img.width || 1024;
@@ -1185,19 +1394,47 @@ let embeddedHybridHTML = #"""
           return;
         }
 
-        // Local A19 Pro Metal
-        const modelPath = el.selectCheckpoint.value;
-        if (!modelPath) return showToast('Chưa chọn model! Hãy bấm Nạp File hoặc chép model vào Tệp/ComfyStudio/Models.', 'error');
-        if (state.currentMode === 'depth') return showToast('Depth ControlNet chỉ hỗ trợ trên chế độ Colab!', 'info');
-        if ((state.currentMode === 'i2i' || state.currentMode === 'inpaint') && !state.baseImageObj) return showToast('Hãy chọn ảnh nguồn trước!', 'error');
-        if (state.currentMode === 'inpaint' && !state.hasMaskDrawn) return showToast('Hãy tô vùng mask cần sửa trên ảnh!', 'error');
-
         let seed = parseInt(el.inputSeed.value);
         if (el.checkRandomSeed.checked || isNaN(seed)) {
           seed = Math.floor(Math.random() * 1000000000);
           el.inputSeed.value = seed;
         }
         el.metaInfo.textContent = `Seed: ${seed} · Steps: ${el.sliderSteps.value}`;
+
+        if (state.engine === 'grpc') {
+          const ep = sanitizeHostPort(el.grpcEndpointInput.value);
+          if (!ep) return showToast('Chưa nhập địa chỉ Draw Things gRPC Server!', 'error');
+          if (state.currentMode === 'depth') return showToast('Depth ControlNet chỉ hỗ trợ trên tab Colab!', 'info');
+          if ((state.currentMode === 'i2i' || state.currentMode === 'inpaint') && !state.baseImageObj) return showToast('Hãy chọn ảnh nguồn trước!', 'error');
+          if (state.currentMode === 'inpaint' && !state.hasMaskDrawn) return showToast('Hãy tô vùng mask cần sửa trên ảnh!', 'error');
+
+          startGenUI('Đang kết nối & sinh ảnh qua Draw Things gRPC...');
+          window.webkit?.messageHandlers?.generateDTGrpcHandler?.postMessage({
+            endpoint: ep,
+            useTLS: el.grpcTlsCheck.checked,
+            modelName: el.selectCheckpoint.value,
+            loraName: el.checkEnableLora.checked ? el.selectLora.value : 'None',
+            loraStrength: parseFloat(el.loraStrengthSlider.value) || 0.85,
+            prompt: el.positivePrompt.value.trim(),
+            negativePrompt: el.negativePrompt.value.trim(),
+            width: parseInt(el.inputWidth.value) || 1024,
+            height: parseInt(el.inputHeight.value) || 1024,
+            steps: parseInt(el.sliderSteps.value) || 12,
+            cfg: parseFloat(el.sliderCfg.value) || 3.5,
+            seed,
+            initImage: (state.currentMode !== 't2i') ? el.baseCanvas.toDataURL('image/png') : null,
+            maskImage: (state.currentMode === 'inpaint') ? getMaskExportBase64() : null,
+            denoise: parseFloat(el.denoiseSlider.value) || 0.75
+          });
+          return;
+        }
+
+        // Local A19 Pro Metal
+        const modelPath = el.selectCheckpoint.value;
+        if (!modelPath) return showToast('Chưa chọn model! Hãy bấm Nạp File hoặc chép model vào Tệp/ComfyStudio/Models.', 'error');
+        if (state.currentMode === 'depth') return showToast('Depth ControlNet chỉ hỗ trợ trên chế độ Colab!', 'info');
+        if ((state.currentMode === 'i2i' || state.currentMode === 'inpaint') && !state.baseImageObj) return showToast('Hãy chọn ảnh nguồn trước!', 'error');
+        if (state.currentMode === 'inpaint' && !state.hasMaskDrawn) return showToast('Hãy tô vùng mask cần sửa trên ảnh!', 'error');
 
         startGenUI('Đang chạy SDXL trên GPU A19 Pro...');
         window.webkit?.messageHandlers?.generateLocalHandler?.postMessage({
@@ -1223,7 +1460,6 @@ let embeddedHybridHTML = #"""
         im.src = dataUrl;
       };
 
-      // Vẽ Mask
       function getCanvasPt(e) {
         const r = el.maskCanvas.getBoundingClientRect();
         return { x: (e.clientX - r.left) * (el.maskCanvas.width / r.width), y: (e.clientY - r.top) * (el.maskCanvas.height / r.height) };
@@ -1256,9 +1492,15 @@ let embeddedHybridHTML = #"""
       // Gắn sự kiện
       el.engineLocalBtn.addEventListener('click', () => switchEngine('local'));
       el.engineCloudBtn.addEventListener('click', () => switchEngine('cloud'));
+      el.engineGrpcBtn.addEventListener('click', () => switchEngine('grpc'));
+
       el.btnConnect.addEventListener('click', connectCloudServer);
       el.btnPasteUrl.addEventListener('click', async () => { try { const t = await navigator.clipboard.readText(); if (t) el.serverUrlInput.value = t.trim(); } catch(_){} });
-      el.selectCheckpoint.addEventListener('change', onCloudModelChange);
+
+      el.btnConnectGrpc.addEventListener('click', connectDrawThingsServer);
+      el.btnPasteGrpc.addEventListener('click', async () => { try { const t = await navigator.clipboard.readText(); if (t) el.grpcEndpointInput.value = sanitizeHostPort(t); } catch(_){} });
+
+      el.selectCheckpoint.addEventListener('change', onModelSelectionChange);
 
       el.btnScanLocal.addEventListener('click', () => window.webkit?.messageHandlers?.scanLocalModelsHandler?.postMessage('scan'));
       el.btnImportModel.addEventListener('click', () => window.webkit?.messageHandlers?.importLocalModelHandler?.postMessage('import'));
@@ -1313,12 +1555,15 @@ let embeddedHybridHTML = #"""
       el.btnGenerate.addEventListener('click', handleGenerateClick);
       el.btnInterrupt.addEventListener('click', async () => {
         if (state.engine === 'local') window.webkit?.messageHandlers?.cancelLocalHandler?.postMessage('cancel');
+        else if (state.engine === 'grpc') window.webkit?.messageHandlers?.cancelDTGrpcHandler?.postMessage('cancel');
         else try { await fetch(`${sanitizeUrl(state.serverUrl)}/interrupt`, { method: 'POST' }); } catch(_) {}
         stopGenUI();
       });
 
       window.addEventListener('DOMContentLoaded', () => {
         el.serverUrlInput.value = state.serverUrl;
+        el.grpcEndpointInput.value = state.grpcEndpoint;
+        el.grpcTlsCheck.checked = state.grpcUseTLS;
         setTimeout(() => window.webkit?.messageHandlers?.scanLocalModelsHandler?.postMessage('scan'), 300);
       });
     </script>
