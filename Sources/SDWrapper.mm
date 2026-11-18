@@ -104,7 +104,6 @@ extern "C" int sd_cli_main(int argc, const char **argv);
         std::vector<std::string> args;
         args.push_back("sd-cli");
 
-        // Nếu có initImage -> chế độ img2img
         if (initImgPath) {
             args.push_back("-M");
             args.push_back("img2img");
@@ -153,11 +152,12 @@ extern "C" int sd_cli_main(int argc, const char **argv);
         args.push_back("-s");
         args.push_back(std::to_string(seed));
 
-        // 5. Bắt luồng stdout/stderr bằng pipe để cập nhật progress bar theo từng step
+        // 5. Bắt luồng stdout/stderr bằng pipe (tách readFd thành biến int thường để dùng trong Obj-C block)
         int pipeFds[2];
         int savedStdout = dup(STDOUT_FILENO);
         int savedStderr = dup(STDERR_FILENO);
         bool pipeActive = (pipe(pipeFds) == 0);
+        int readFd = pipeActive ? pipeFds[0] : -1;
 
         dispatch_source_t readSource = nil;
         __block std::string logTail;
@@ -167,15 +167,14 @@ extern "C" int sd_cli_main(int argc, const char **argv);
             dup2(pipeFds[1], STDERR_FILENO);
             close(pipeFds[1]);
 
-            fcntl(pipeFds[0], F_SETFL, O_NONBLOCK);
-            readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, pipeFds[0], 0, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+            fcntl(readFd, F_SETFL, O_NONBLOCK);
+            readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, readFd, 0, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
 
             dispatch_source_set_event_handler(readSource, ^{
                 char buf[1024];
-                ssize_t bytesRead = read(pipeFds[0], buf, sizeof(buf) - 1);
+                ssize_t bytesRead = read(readFd, buf, sizeof(buf) - 1);
                 if (bytesRead > 0) {
                     buf[bytesRead] = '\0';
-                    // Vẫn in ra console thật để debug nếu cần
                     write(savedStdout, buf, bytesRead);
 
                     logTail.append(buf, bytesRead);
@@ -183,25 +182,26 @@ extern "C" int sd_cli_main(int argc, const char **argv);
                         logTail.erase(0, logTail.size() - 2048);
                     }
 
-                    // Phân tích chuỗi dạng " 4/8 " từ thanh tiến trình của stable-diffusion.cpp
                     NSString *chunk = [NSString stringWithUTF8String:buf];
-                    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(\\d+)\\s*/\\s*(\\d+)" options:0 error:nil];
-                    NSTextCheckingResult *match = [regex firstMatchInString:chunk options:0 range:NSMakeRange(0, chunk.length)];
-                    if (match && match.numberOfRanges >= 3) {
-                        int curStep = [[chunk substringWithRange:[match rangeAtIndex:1]] intValue];
-                        int totSteps = [[chunk substringWithRange:[match rangeAtIndex:2]] intValue];
-                        float elapsed = (float)[[NSDate date] timeIntervalSinceDate:startTime];
-                        if (progressBlock && totSteps > 0 && curStep <= totSteps) {
-                            dispatch_async(dispatch_get_main_queue(), ^{
-                                progressBlock(curStep, totSteps, elapsed);
-                            });
+                    if (chunk) {
+                        NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(\\d+)\\s*/\\s*(\\d+)" options:0 error:nil];
+                        NSTextCheckingResult *match = [regex firstMatchInString:chunk options:0 range:NSMakeRange(0, chunk.length)];
+                        if (match && match.numberOfRanges >= 3) {
+                            int curStep = [[chunk substringWithRange:[match rangeAtIndex:1]] intValue];
+                            int totSteps = [[chunk substringWithRange:[match rangeAtIndex:2]] intValue];
+                            float elapsed = (float)[[NSDate date] timeIntervalSinceDate:startTime];
+                            if (progressBlock && totSteps > 0 && curStep <= totSteps) {
+                                dispatch_async(dispatch_get_main_queue(), ^{
+                                    progressBlock(curStep, totSteps, elapsed);
+                                });
+                            }
                         }
                     }
                 }
             });
 
             dispatch_source_set_cancel_handler(readSource, ^{
-                close(pipeFds[0]);
+                close(readFd);
             });
             dispatch_resume(readSource);
         }
