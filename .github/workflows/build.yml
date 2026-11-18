@@ -1,102 +1,134 @@
-name: Build ComfyStudio Metal IPA
+name: Build ComfyStudio Hybrid IPA
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-ios:
+  build-ipa:
     runs-on: macos-15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Clone stable-diffusion.cpp
-        run: |
-          git clone --recursive --depth 1 https://github.com/leejet/stable-diffusion.cpp.git sd_cpp
+      - name: Install build tools (cmake, llvm)
+        run: brew install cmake llvm
 
-      - name: Compile stable-diffusion.cpp with Metal for iOS arm64
+      - name: Clone & Build stable-diffusion.cpp (Metal + CLI objects)
         run: |
-          mkdir -p sd_build
-          cd sd_build
-          cmake ../sd_cpp \
+          git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git sd_cpp
+          cd sd_cpp
+          mkdir build_ios && cd build_ios
+
+          cmake .. \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
-            -DCMAKE_BUILD_TYPE=Release \
             -DSD_METAL=ON \
-            -DSD_BUILD_SHARED_LIBS=OFF \
-            -DSD_BUILD_EXAMPLES=OFF
-          cmake --build . --config Release -j $(sysctl -n hw.ncpu)
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DSD_BUILD_EXAMPLES=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
 
-      - name: Compile Swift + ObjC++ & Package Unsigned IPA
-        run: |
-          APP_NAME="ComfyStudio"
-          BUNDLE_ID="com.cuongte92.comfystudio"
-          APP_DIR="Payload/${APP_NAME}.app"
-          mkdir -p "$APP_DIR"
+          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
 
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          CLANG_CXX=$(xcrun --sdk iphoneos --find clang++)
-          SWIFTC=$(xcrun --sdk iphoneos --find swiftc)
+          # Gom tất cả file .o của target sd-cli (bao gồm main.cpp.o và examples/common/*.o)
+          mkdir -p cli_objs
+          find . -path "*sd-cli*.dir*" -name "*.o" -exec cp {} cli_objs/ \;
 
-          CLI_MAIN=$(find sd_cpp/examples -path "*cli*" -name "main.cpp" | head -n 1)
-          if [ -z "$CLI_MAIN" ]; then
-            CLI_MAIN=$(find sd_cpp/examples -name "main.cpp" | grep -v "server" | head -n 1)
-          fi
-          CLI_DIR=$(dirname "$CLI_MAIN")
-          SD_INC=$(dirname $(find sd_cpp -name "stable-diffusion.h" | head -n 1))
-
-          sed 's/int main(/extern "C" int sd_cli_main(/g' "$CLI_MAIN" > sd_build/sd_cli_bridge.cpp
-
-          INC_FLAGS="-I$CLI_DIR -I$SD_INC -Isd_cpp -Isd_cpp/include -Isd_cpp/examples -Isd_cpp/examples/common -Isd_cpp/ggml/include -Isd_cpp/thirdparty"
-
-          # 1. Compile sd_cli_bridge.cpp
-          $CLANG_CXX -c sd_build/sd_cli_bridge.cpp \
-            -o sd_build/sd_cli_bridge.o \
-            -arch arm64 \
-            -isysroot "$SDK_PATH" \
-            -miphoneos-version-min=16.0 \
-            -std=c++17 -O3 $INC_FLAGS
-
-          # 2. Compile toàn bộ các file .cpp phụ trợ trong examples/common (log.cpp, common.cpp...)
-          EXTRA_OBJS=""
-          idx=0
-          for cpp_file in $(find sd_cpp/examples/common -name "*.cpp" 2>/dev/null); do
-            obj_file="sd_build/sd_extra_${idx}.o"
-            $CLANG_CXX -c "$cpp_file" \
-              -o "$obj_file" \
-              -arch arm64 \
-              -isysroot "$SDK_PATH" \
-              -miphoneos-version-min=16.0 \
-              -std=c++17 -O3 $INC_FLAGS
-            EXTRA_OBJS="$EXTRA_OBJS $obj_file"
-            idx=$((idx + 1))
+          # Tìm file chứa symbol _main và đổi thành _sd_cli_main bằng llvm-objcopy
+          LLVM_OBJCOPY="$(brew --prefix llvm)/bin/llvm-objcopy"
+          for obj in cli_objs/*.o; do
+            if nm -g "$obj" 2>/dev/null | grep -q " _main$"; then
+              echo "Renaming _main -> _sd_cli_main in $obj"
+              "$LLVM_OBJCOPY" --redefine-sym _main=_sd_cli_main "$obj"
+            fi
           done
 
-          # 3. Compile SDWrapper.mm
-          $CLANG_CXX -c Sources/SDWrapper.mm \
-            -o sd_build/SDWrapper.o \
+          # Đóng gói thành thư viện tĩnh libsd_cli_all.a
+          ar rcs libsd_cli_all.a cli_objs/*.o
+          ranlib libsd_cli_all.a
+
+      - name: Compile Swift & Obj-C++ and Package IPA
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          BUILD_DIR="build_out"
+          APP_DIR="$BUILD_DIR/Payload/ComfyStudio.app"
+          mkdir -p "$APP_DIR"
+
+          # 1. Tạo Info.plist hỗ trợ chia sẻ thư mục Tệp / ComfyStudio
+          cat << 'EOF' > "$APP_DIR/Info.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>ComfyStudio</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.cuongte92.comfystudio</string>
+            <key>CFBundleName</key>
+            <string>ComfyStudio</string>
+            <key>CFBundleDisplayName</key>
+            <string>ComfyStudio</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0.0</string>
+            <key>CFBundleVersion</key>
+            <string>1</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSRequiresIPhoneOS</key>
+            <true/>
+            <key>MinimumOSVersion</key>
+            <string>16.0</string>
+            <key>UIFileSharingEnabled</key>
+            <true/>
+            <key>LSSupportsOpeningDocumentsInPlace</key>
+            <true/>
+            <key>NSPhotoLibraryUsageDescription</key>
+            <string>Chọn ảnh đầu vào cho Img2Img và Inpaint.</string>
+            <key>NSPhotoLibraryAddUsageDescription</key>
+            <string>Lưu ảnh đã tạo vào thư viện Ảnh.</string>
+            <key>NSAppTransportSecurity</key>
+            <dict>
+              <key>NSAllowsArbitraryLoads</key>
+              <true/>
+            </dict>
+            <key>UILaunchScreen</key>
+            <dict/>
+          </dict>
+          </plist>
+          EOF
+
+          # 2. Biên dịch SDWrapper.mm
+          clang++ -c Sources/SDWrapper.mm \
+            -o "$BUILD_DIR/SDWrapper.o" \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
-            -miphoneos-version-min=16.0 \
-            -std=c++17 -O3 -fobjc-arc
+            -mios-version-min=16.0 \
+            -std=c++17 \
+            -fobjc-arc \
+            -Isd_cpp/include \
+            -Isd_cpp/ggml/include
 
-          STATIC_LIBS=$(find sd_build -name "*.a" | tr '\n' ' ')
+          # 3. Gom tất cả thư viện tĩnh (.a) từ CMake build
+          STATIC_LIBS=$(find sd_cpp/build_ios -name "*.a")
+          echo "Linking static libs:"
+          echo "$STATIC_LIBS"
 
-          # 4. Compile Swift + Link Frameworks
-          $SWIFTC Sources/MyApp.swift Sources/ContentView.swift sd_build/SDWrapper.o sd_build/sd_cli_bridge.o $EXTRA_OBJS \
-            $STATIC_LIBS \
-            -import-objc-header Sources/SDWrapper.h \
+          # 4. Biên dịch Swift & Link toàn bộ thành binary ComfyStudio
+          swiftc Sources/MyApp.swift Sources/ContentView.swift "$BUILD_DIR/SDWrapper.o" \
+            -o "$APP_DIR/ComfyStudio" \
             -target arm64-apple-ios16.0 \
             -sdk "$SDK_PATH" \
-            -O \
+            -import-objc-header Sources/SDWrapper.h \
             -lc++ \
+            -framework Foundation \
             -framework UIKit \
             -framework SwiftUI \
             -framework WebKit \
@@ -104,60 +136,24 @@ jobs:
             -framework UniformTypeIdentifiers \
             -framework Metal \
             -framework MetalKit \
-            -framework Foundation \
             -framework Accelerate \
-            -o "${APP_DIR}/${APP_NAME}"
+            $STATIC_LIBS
 
-          find sd_build -name "*.metallib" -exec cp {} "$APP_DIR/" \; || true
+          # 5. Nén thành file ComfyStudio.ipa
+          cd "$BUILD_DIR"
+          zip -r ../ComfyStudio.ipa Payload
 
-          cat <<EOF > "${APP_DIR}/Info.plist"
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>${APP_NAME}</string>
-              <key>CFBundleIdentifier</key>
-              <string>${BUNDLE_ID}</string>
-              <key>CFBundleName</key>
-              <string>${APP_NAME}</string>
-              <key>CFBundleDisplayName</key>
-              <string>ComfyStudio</string>
-              <key>CFBundleVersion</key>
-              <string>${{ github.run_number }}</string>
-              <key>CFBundleShortVersionString</key>
-              <string>1.0.${{ github.run_number }}</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>LSRequiresIPhoneOS</key>
-              <true/>
-              <key>UILaunchScreen</key>
-              <dict/>
-              <key>UIFileSharingEnabled</key>
-              <true/>
-              <key>LSSupportsOpeningDocumentsInPlace</key>
-              <true/>
-              <key>NSAppTransportSecurity</key>
-              <dict>
-                  <key>NSAllowsArbitraryLoads</key>
-                  <true/>
-              </dict>
-          </dict>
-          </plist>
-          EOF
-
-          zip -r ComfyStudio_Unsigned.ipa Payload
-
-      - name: Upload Unsigned IPA Artifact
+      - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ComfyStudio_Unsigned_IPA
-          path: ComfyStudio_Unsigned.ipa
+          name: ComfyStudio-iOS-IPA
+          path: ComfyStudio.ipa
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
-          name: ComfyStudio v1.0.${{ github.run_number }} (A19 Pro Metal)
-          body: "Bản build tự động ComfyStudio Hybrid (Local Metal + Colab Tunnel)."
-          files: ComfyStudio_Unsigned.ipa
+          name: ComfyStudio Hybrid v1.0.${{ github.run_number }}
+          files: ComfyStudio.ipa
+          draft: false
+          prerelease: false
