@@ -16,15 +16,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install build tools (cmake, llvm)
-        run: brew install cmake llvm
+      - name: Install build tools (cmake, llvm, grpc, flatbuffers)
+        run: brew install cmake llvm grpc protobuf flatbuffers
+
+      - name: Fetch Draw Things gRPC Proto & FlatBuffers Schema
+        run: |
+          mkdir -p dt_schema dt_gen
+          curl -fsSL https://raw.githubusercontent.com/drawthingsai/draw-things-community/main/Libraries/GRPC/Server/Sources/imageService.proto -o dt_schema/imageService.proto
+          curl -fsSL https://raw.githubusercontent.com/drawthingsai/draw-things-community/main/Libraries/DataModels/Sources/config.fbs -o dt_schema/config.fbs
+
+          PROTOC="$(brew --prefix protobuf)/bin/protoc"
+          GRPC_CPP_PLUGIN="$(brew --prefix grpc)/bin/grpc_cpp_plugin"
+          FLATC="$(brew --prefix flatbuffers)/bin/flatc"
+
+          "$PROTOC" -I dt_schema --cpp_out=dt_gen --grpc_out=dt_gen --plugin=protoc-gen-grpc="$GRPC_CPP_PLUGIN" dt_schema/imageService.proto
+          "$FLATC" --cpp -o dt_gen dt_schema/config.fbs
 
       - name: Clone & Build stable-diffusion.cpp (Metal + CLI objects)
         run: |
           git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git sd_cpp
           cd sd_cpp
 
-          # Xóa từ dòng install( đến hết file examples/cli/CMakeLists.txt và tắt sd-server
           sed -i '' '/install(/,$d' examples/cli/CMakeLists.txt
           sed -i '' 's/add_subdirectory(server)/# add_subdirectory(server)/g' examples/CMakeLists.txt
 
@@ -46,26 +58,50 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_BUILD_TYPE=Release
 
-          # Build thư viện lõi trước cho chắc chắn, sau đó compile các file .o của sd-cli (bỏ qua bước link sd-cli.app)
           cmake --build . --target stable-diffusion --config Release -j$(sysctl -n hw.ncpu)
           cmake --build . --target sd-cli --config Release -j$(sysctl -n hw.ncpu) || true
 
-          # Gom tất cả file .o của target sd-cli (bao gồm main.cpp.o và examples/common/*.o)
           mkdir -p cli_objs
           find . -path "*sd-cli*.dir*" -name "*.o" -exec cp {} cli_objs/ \;
-          ls -la cli_objs/
 
-          # Đổi tên symbol _main -> _sd_cli_main bằng llvm-objcopy
           LLVM_OBJCOPY="$(brew --prefix llvm)/bin/llvm-objcopy"
           for obj in cli_objs/*.o; do
             if nm -g "$obj" 2>/dev/null | grep -q " _main$"; then
-              echo "Renaming _main -> _sd_cli_main in $obj"
               "$LLVM_OBJCOPY" --redefine-sym _main=_sd_cli_main "$obj"
             fi
           done
 
           ar rcs libsd_cli_all.a cli_objs/*.o
           ranlib libsd_cli_all.a
+
+      - name: Build gRPC + Protobuf + FlatBuffers for iOS arm64
+        run: |
+          git clone --depth 1 -b v1.66.0 https://github.com/grpc/grpc.git grpc_src
+          cd grpc_src
+          git submodule update --init --depth 1 third_party/abseil-cpp third_party/protobuf third_party/re2 third_party/cares/cares third_party/boringssl-with-bazel
+          mkdir build_ios && cd build_ios
+
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DgRPC_INSTALL=OFF \
+            -DgRPC_BUILD_TESTS=OFF \
+            -DgRPC_BUILD_CODEGEN=OFF \
+            -DgRPC_BUILD_GRPC_CPP_PLUGIN=OFF \
+            -DgRPC_BUILD_CSHARP_EXT=OFF \
+            -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF \
+            -DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF \
+            -Dprotobuf_BUILD_TESTS=OFF \
+            -Dprotobuf_BUILD_PROTOC_BINARIES=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build . --target grpc++ --config Release -j$(sysctl -n hw.ncpu)
 
       - name: Compile Swift & Obj-C++ and Package IPA
         run: |
@@ -74,7 +110,6 @@ jobs:
           APP_DIR="$BUILD_DIR/Payload/ComfyStudio.app"
           mkdir -p "$APP_DIR"
 
-          # 1. Tạo Info.plist hỗ trợ chia sẻ thư mục Tệp / ComfyStudio
           cat << 'EOF' > "$APP_DIR/Info.plist"
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -117,7 +152,14 @@ jobs:
           </plist>
           EOF
 
-          # 2. Biên dịch SDWrapper.mm
+          FB_INC="$(brew --prefix flatbuffers)/include"
+          GRPC_INCS="-Igrpc_src/include -Igrpc_src/third_party/protobuf/src -Igrpc_src/third_party/abseil-cpp -Idt_gen -I${FB_INC}"
+
+          # Biên dịch file proto sinh ra của Draw Things
+          clang++ -c dt_gen/imageService.pb.cc -o "$BUILD_DIR/imageService.pb.o" -arch arm64 -isysroot "$SDK_PATH" -mios-version-min=16.0 -std=c++17 $GRPC_INCS
+          clang++ -c dt_gen/imageService.grpc.pb.cc -o "$BUILD_DIR/imageService.grpc.pb.o" -arch arm64 -isysroot "$SDK_PATH" -mios-version-min=16.0 -std=c++17 $GRPC_INCS
+
+          # Biên dịch SDWrapper.mm (gồm cả Local Metal + Draw Things gRPC Client)
           clang++ -c Sources/SDWrapper.mm \
             -o "$BUILD_DIR/SDWrapper.o" \
             -arch arm64 \
@@ -126,20 +168,21 @@ jobs:
             -std=c++17 \
             -fobjc-arc \
             -Isd_cpp/include \
-            -Isd_cpp/ggml/include
+            -Isd_cpp/ggml/include \
+            $GRPC_INCS
 
-          # 3. Gom tất cả thư viện tĩnh (.a) từ CMake build
-          STATIC_LIBS=$(find sd_cpp/build_ios -name "*.a")
-          echo "Linking static libs:"
-          echo "$STATIC_LIBS"
+          SD_LIBS=$(find sd_cpp/build_ios -name "*.a")
+          GRPC_LIBS=$(find grpc_src/build_ios -name "*.a")
 
-          # 4. Biên dịch Swift & Link toàn bộ thành binary ComfyStudio
-          swiftc Sources/MyApp.swift Sources/ContentView.swift "$BUILD_DIR/SDWrapper.o" \
+          swiftc Sources/MyApp.swift Sources/ContentView.swift \
+            "$BUILD_DIR/SDWrapper.o" \
+            "$BUILD_DIR/imageService.pb.o" \
+            "$BUILD_DIR/imageService.grpc.pb.o" \
             -o "$APP_DIR/ComfyStudio" \
             -target arm64-apple-ios16.0 \
             -sdk "$SDK_PATH" \
             -import-objc-header Sources/SDWrapper.h \
-            -lc++ \
+            -lc++ -lz -lresolv \
             -framework Foundation \
             -framework UIKit \
             -framework SwiftUI \
@@ -149,9 +192,9 @@ jobs:
             -framework Metal \
             -framework MetalKit \
             -framework Accelerate \
-            $STATIC_LIBS
+            $SD_LIBS \
+            $GRPC_LIBS
 
-          # 5. Nén thành file ComfyStudio.ipa
           cd "$BUILD_DIR"
           zip -r ../ComfyStudio.ipa Payload
 
