@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+
 jobs:
   build-ios:
     runs-on: macos-15
@@ -42,10 +45,9 @@ jobs:
           CLANG_CXX=$(xcrun --sdk iphoneos --find clang++)
           SWIFTC=$(xcrun --sdk iphoneos --find swiftc)
 
-          # Tự động xác định thư mục chứa stable-diffusion.h
           SD_HEADER_DIR=$(dirname $(find sd_cpp -name "stable-diffusion.h" | head -n 1))
 
-          # 1. Compile SDWrapper.mm (Objective-C++ Bridge)
+          # 1. Compile SDWrapper.mm
           $CLANG_CXX -c Sources/SDWrapper.mm \
             -o sd_build/SDWrapper.o \
             -arch arm64 \
@@ -54,10 +56,10 @@ jobs:
             -std=c++17 -O3 -fobjc-arc \
             -I"$SD_HEADER_DIR" -Isd_cpp -Isd_cpp/include -Isd_cpp/ggml/include
 
-          # 2. Tìm toàn bộ file .a đã build từ stable-diffusion.cpp & ggml
+          # 2. Tìm toàn bộ file .a
           STATIC_LIBS=$(find sd_build -name "*.a" | tr '\n' ' ')
 
-          # 3. Compile Swift + Link Metal & Accelerate Frameworks
+          # 3. Compile Swift + Link Frameworks
           $SWIFTC Sources/MyApp.swift Sources/ContentView.swift sd_build/SDWrapper.o \
             $STATIC_LIBS \
             -import-objc-header Sources/SDWrapper.h \
@@ -76,10 +78,10 @@ jobs:
             -framework Accelerate \
             -o "${APP_DIR}/${APP_NAME}"
 
-          # 4. Copy shader default.metallib nếu cmake có sinh ra
+          # 4. Copy shader Metal nếu có
           find sd_build -name "*.metallib" -exec cp {} "$APP_DIR/" \; || true
 
-          # 5. Tạo Info.plist hỗ trợ mở thư mục trong ứng dụng Tệp (Files) iOS
+          # 5. Tạo Info.plist
           cat <<EOF > "${APP_DIR}/Info.plist"
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -94,9 +96,9 @@ jobs:
               <key>CFBundleDisplayName</key>
               <string>ComfyStudio</string>
               <key>CFBundleVersion</key>
-              <string>1</string>
+              <string>${{ github.run_number }}</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.0.0</string>
+              <string>1.0.${{ github.run_number }}</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>LSRequiresIPhoneOS</key>
@@ -116,7 +118,7 @@ jobs:
           </plist>
           EOF
 
-          # 6. Đóng gói IPA chưa ký để tải về ký bằng ESign
+          # 6. Đóng gói IPA chưa ký
           zip -r ComfyStudio_Unsigned.ipa Payload
 
       - name: Upload Unsigned IPA Artifact
@@ -124,3 +126,11 @@ jobs:
         with:
           name: ComfyStudio_Unsigned_IPA
           path: ComfyStudio_Unsigned.ipa
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: ComfyStudio v1.0.${{ github.run_number }} (A19 Pro Metal)
+          body: "Bản build tự động ComfyStudio Hybrid (Local Metal + Colab Tunnel)."
+          files: ComfyStudio_Unsigned.ipa
