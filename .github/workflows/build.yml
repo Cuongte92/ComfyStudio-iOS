@@ -400,10 +400,11 @@ jobs:
             -DCMAKE_CXX_STANDARD=17 \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             -DgRPC_INSTALL=OFF \
+            -Dprotobuf_INSTALL=OFF \
+            -DABSL_ENABLE_INSTALL=OFF \
             -DgRPC_BUILD_TESTS=OFF \
             -DgRPC_BUILD_CODEGEN=OFF \
             -DgRPC_BUILD_GRPC_CPP_PLUGIN=OFF \
-            -DgRPC_BUILD_CSHARP_EXT=OFF \
             -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
             -DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF \
             -DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF \
