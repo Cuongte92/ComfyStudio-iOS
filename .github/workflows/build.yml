@@ -42,6 +42,9 @@ jobs:
           CLANG_CXX=$(xcrun --sdk iphoneos --find clang++)
           SWIFTC=$(xcrun --sdk iphoneos --find swiftc)
 
+          # Tự động xác định thư mục chứa stable-diffusion.h
+          SD_HEADER_DIR=$(dirname $(find sd_cpp -name "stable-diffusion.h" | head -n 1))
+
           # 1. Compile SDWrapper.mm (Objective-C++ Bridge)
           $CLANG_CXX -c Sources/SDWrapper.mm \
             -o sd_build/SDWrapper.o \
@@ -49,7 +52,7 @@ jobs:
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=16.0 \
             -std=c++17 -O3 -fobjc-arc \
-            -Isd_cpp -Isd_cpp/ggml/include
+            -I"$SD_HEADER_DIR" -Isd_cpp -Isd_cpp/include -Isd_cpp/ggml/include
 
           # 2. Tìm toàn bộ file .a đã build từ stable-diffusion.cpp & ggml
           STATIC_LIBS=$(find sd_build -name "*.a" | tr '\n' ' ')
