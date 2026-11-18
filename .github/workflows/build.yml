@@ -24,8 +24,8 @@ jobs:
           git clone --recursive https://github.com/leejet/stable-diffusion.cpp.git sd_cpp
           cd sd_cpp
 
-          # Vá lỗi BUNDLE DESTINATION khi cross-compile iOS và vô hiệu hóa build sd-server
-          sed -i '' 's/RUNTIME DESTINATION bin/RUNTIME DESTINATION bin BUNDLE DESTINATION bin/g' examples/cli/CMakeLists.txt
+          # Xóa từ dòng install( đến hết file examples/cli/CMakeLists.txt và tắt sd-server
+          sed -i '' '/install(/,$d' examples/cli/CMakeLists.txt
           sed -i '' 's/add_subdirectory(server)/# add_subdirectory(server)/g' examples/CMakeLists.txt
 
           mkdir build_ios && cd build_ios
@@ -47,7 +47,7 @@ jobs:
           mkdir -p cli_objs
           find . -path "*sd-cli*.dir*" -name "*.o" -exec cp {} cli_objs/ \;
 
-          # Tìm file chứa symbol _main và đổi thành _sd_cli_main bằng llvm-objcopy
+          # Đổi tên symbol _main -> _sd_cli_main bằng llvm-objcopy
           LLVM_OBJCOPY="$(brew --prefix llvm)/bin/llvm-objcopy"
           for obj in cli_objs/*.o; do
             if nm -g "$obj" 2>/dev/null | grep -q " _main$"; then
@@ -56,7 +56,6 @@ jobs:
             fi
           done
 
-          # Đóng gói thành thư viện tĩnh libsd_cli_all.a
           ar rcs libsd_cli_all.a cli_objs/*.o
           ranlib libsd_cli_all.a
 
