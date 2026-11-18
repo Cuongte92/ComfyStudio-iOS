@@ -46,11 +46,14 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_BUILD_TYPE=Release
 
-          cmake --build . --target sd-cli --config Release -j$(sysctl -n hw.ncpu)
+          # Build thư viện lõi trước cho chắc chắn, sau đó compile các file .o của sd-cli (bỏ qua bước link sd-cli.app)
+          cmake --build . --target stable-diffusion --config Release -j$(sysctl -n hw.ncpu)
+          cmake --build . --target sd-cli --config Release -j$(sysctl -n hw.ncpu) || true
 
           # Gom tất cả file .o của target sd-cli (bao gồm main.cpp.o và examples/common/*.o)
           mkdir -p cli_objs
           find . -path "*sd-cli*.dir*" -name "*.o" -exec cp {} cli_objs/ \;
+          ls -la cli_objs/
 
           # Đổi tên symbol _main -> _sd_cli_main bằng llvm-objcopy
           LLVM_OBJCOPY="$(brew --prefix llvm)/bin/llvm-objcopy"
