@@ -1,1 +1,123 @@
+name: Build ComfyStudio Metal IPA
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone stable-diffusion.cpp
+        run: |
+          git clone --recursive --depth 1 https://github.com/leejet/stable-diffusion.cpp.git sd_cpp
+
+      - name: Compile stable-diffusion.cpp with Metal for iOS arm64
+        run: |
+          mkdir -p sd_build
+          cd sd_build
+          cmake ../sd_cpp \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_METAL=ON \
+            -DSD_BUILD_SHARED_LIBS=OFF \
+            -DSD_BUILD_EXAMPLES=OFF
+          cmake --build . --config Release -j $(sysctl -n hw.ncpu)
+
+      - name: Compile Swift + ObjC++ & Package Unsigned IPA
+        run: |
+          APP_NAME="ComfyStudio"
+          BUNDLE_ID="com.cuongte92.comfystudio"
+          APP_DIR="Payload/${APP_NAME}.app"
+          mkdir -p "$APP_DIR"
+
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG_CXX=$(xcrun --sdk iphoneos --find clang++)
+          SWIFTC=$(xcrun --sdk iphoneos --find swiftc)
+
+          # 1. Compile SDWrapper.mm (Objective-C++ Bridge)
+          $CLANG_CXX -c Sources/SDWrapper.mm \
+            -o sd_build/SDWrapper.o \
+            -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=16.0 \
+            -std=c++17 -O3 -fobjc-arc \
+            -Isd_cpp -Isd_cpp/ggml/include
+
+          # 2. Tìm toàn bộ file .a đã build từ stable-diffusion.cpp & ggml
+          STATIC_LIBS=$(find sd_build -name "*.a" | tr '\n' ' ')
+
+          # 3. Compile Swift + Link Metal & Accelerate Frameworks
+          $SWIFTC Sources/MyApp.swift Sources/ContentView.swift sd_build/SDWrapper.o \
+            $STATIC_LIBS \
+            -import-objc-header Sources/SDWrapper.h \
+            -target arm64-apple-ios16.0 \
+            -sdk "$SDK_PATH" \
+            -O \
+            -lc++ \
+            -framework UIKit \
+            -framework SwiftUI \
+            -framework WebKit \
+            -framework PhotosUI \
+            -framework UniformTypeIdentifiers \
+            -framework Metal \
+            -framework MetalKit \
+            -framework Foundation \
+            -framework Accelerate \
+            -o "${APP_DIR}/${APP_NAME}"
+
+          # 4. Copy shader default.metallib nếu cmake có sinh ra
+          find sd_build -name "*.metallib" -exec cp {} "$APP_DIR/" \; || true
+
+          # 5. Tạo Info.plist hỗ trợ mở thư mục trong ứng dụng Tệp (Files) iOS
+          cat <<EOF > "${APP_DIR}/Info.plist"
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>${APP_NAME}</string>
+              <key>CFBundleIdentifier</key>
+              <string>${BUNDLE_ID}</string>
+              <key>CFBundleName</key>
+              <string>${APP_NAME}</string>
+              <key>CFBundleDisplayName</key>
+              <string>ComfyStudio</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0.0</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>UILaunchScreen</key>
+              <dict/>
+              <key>UIFileSharingEnabled</key>
+              <true/>
+              <key>LSSupportsOpeningDocumentsInPlace</key>
+              <true/>
+              <key>NSAppTransportSecurity</key>
+              <dict>
+                  <key>NSAllowsArbitraryLoads</key>
+                  <true/>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          # 6. Đóng gói IPA chưa ký để tải về ký bằng ESign
+          zip -r ComfyStudio_Unsigned.ipa Payload
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ComfyStudio_Unsigned_IPA
+          path: ComfyStudio_Unsigned.ipa
