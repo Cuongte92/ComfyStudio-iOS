@@ -45,22 +45,34 @@ jobs:
           CLANG_CXX=$(xcrun --sdk iphoneos --find clang++)
           SWIFTC=$(xcrun --sdk iphoneos --find swiftc)
 
-          SD_HEADER_DIR=$(dirname $(find sd_cpp -name "stable-diffusion.h" | head -n 1))
+          # Tìm file CLI main.cpp chính chủ của stable-diffusion.cpp và đổi main() -> sd_cli_main()
+          CLI_MAIN=$(find sd_cpp/examples -name "main.cpp" | head -n 1)
+          CLI_DIR=$(dirname "$CLI_MAIN")
+          SD_INC=$(dirname $(find sd_cpp -name "stable-diffusion.h" | head -n 1))
 
-          # 1. Compile SDWrapper.mm
+          sed 's/int main(/extern "C" int sd_cli_main(/g' "$CLI_MAIN" > sd_build/sd_cli_bridge.cpp
+
+          # Compile sd_cli_bridge.cpp
+          $CLANG_CXX -c sd_build/sd_cli_bridge.cpp \
+            -o sd_build/sd_cli_bridge.o \
+            -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=16.0 \
+            -std=c++17 -O3 \
+            -I"$CLI_DIR" -I"$SD_INC" -Isd_cpp -Isd_cpp/include -Isd_cpp/ggml/include -Isd_cpp/thirdparty
+
+          # Compile SDWrapper.mm
           $CLANG_CXX -c Sources/SDWrapper.mm \
             -o sd_build/SDWrapper.o \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=16.0 \
-            -std=c++17 -O3 -fobjc-arc \
-            -I"$SD_HEADER_DIR" -Isd_cpp -Isd_cpp/include -Isd_cpp/ggml/include
+            -std=c++17 -O3 -fobjc-arc
 
-          # 2. Tìm toàn bộ file .a
           STATIC_LIBS=$(find sd_build -name "*.a" | tr '\n' ' ')
 
-          # 3. Compile Swift + Link Frameworks
-          $SWIFTC Sources/MyApp.swift Sources/ContentView.swift sd_build/SDWrapper.o \
+          # Compile Swift + Link Metal & Accelerate Frameworks
+          $SWIFTC Sources/MyApp.swift Sources/ContentView.swift sd_build/SDWrapper.o sd_build/sd_cli_bridge.o \
             $STATIC_LIBS \
             -import-objc-header Sources/SDWrapper.h \
             -target arm64-apple-ios16.0 \
@@ -78,10 +90,8 @@ jobs:
             -framework Accelerate \
             -o "${APP_DIR}/${APP_NAME}"
 
-          # 4. Copy shader Metal nếu có
           find sd_build -name "*.metallib" -exec cp {} "$APP_DIR/" \; || true
 
-          # 5. Tạo Info.plist
           cat <<EOF > "${APP_DIR}/Info.plist"
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -118,7 +128,6 @@ jobs:
           </plist>
           EOF
 
-          # 6. Đóng gói IPA chưa ký
           zip -r ComfyStudio_Unsigned.ipa Payload
 
       - name: Upload Unsigned IPA Artifact
