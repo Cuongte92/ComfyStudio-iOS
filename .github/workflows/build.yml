@@ -45,7 +45,6 @@ jobs:
           CLANG_CXX=$(xcrun --sdk iphoneos --find clang++)
           SWIFTC=$(xcrun --sdk iphoneos --find swiftc)
 
-          # Chọn đúng file cli/main.cpp (tránh bốc nhầm server/main.cpp)
           CLI_MAIN=$(find sd_cpp/examples -path "*cli*" -name "main.cpp" | head -n 1)
           if [ -z "$CLI_MAIN" ]; then
             CLI_MAIN=$(find sd_cpp/examples -name "main.cpp" | grep -v "server" | head -n 1)
@@ -55,30 +54,32 @@ jobs:
 
           sed 's/int main(/extern "C" int sd_cli_main(/g' "$CLI_MAIN" > sd_build/sd_cli_bridge.cpp
 
-          # Compile sd_cli_bridge.cpp (kèm -Isd_cpp/examples để nhận common/common.h)
+          INC_FLAGS="-I$CLI_DIR -I$SD_INC -Isd_cpp -Isd_cpp/include -Isd_cpp/examples -Isd_cpp/examples/common -Isd_cpp/ggml/include -Isd_cpp/thirdparty"
+
+          # 1. Compile sd_cli_bridge.cpp
           $CLANG_CXX -c sd_build/sd_cli_bridge.cpp \
             -o sd_build/sd_cli_bridge.o \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=16.0 \
-            -std=c++17 -O3 \
-            -I"$CLI_DIR" -I"$SD_INC" -Isd_cpp -Isd_cpp/include -Isd_cpp/examples -Isd_cpp/ggml/include -Isd_cpp/thirdparty
+            -std=c++17 -O3 $INC_FLAGS
 
-          # Compile thêm common.cpp nếu CLI có tách file triển khai common
-          COMMON_CPP=$(find sd_cpp/examples -name "common.cpp" | head -n 1)
+          # 2. Compile toàn bộ các file .cpp phụ trợ trong examples/common (log.cpp, common.cpp...)
           EXTRA_OBJS=""
-          if [ -n "$COMMON_CPP" ]; then
-            $CLANG_CXX -c "$COMMON_CPP" \
-              -o sd_build/sd_common.o \
+          idx=0
+          for cpp_file in $(find sd_cpp/examples/common -name "*.cpp" 2>/dev/null); do
+            obj_file="sd_build/sd_extra_${idx}.o"
+            $CLANG_CXX -c "$cpp_file" \
+              -o "$obj_file" \
               -arch arm64 \
               -isysroot "$SDK_PATH" \
               -miphoneos-version-min=16.0 \
-              -std=c++17 -O3 \
-              -I"$CLI_DIR" -I"$SD_INC" -Isd_cpp -Isd_cpp/include -Isd_cpp/examples -Isd_cpp/ggml/include -Isd_cpp/thirdparty
-            EXTRA_OBJS="sd_build/sd_common.o"
-          fi
+              -std=c++17 -O3 $INC_FLAGS
+            EXTRA_OBJS="$EXTRA_OBJS $obj_file"
+            idx=$((idx + 1))
+          done
 
-          # Compile SDWrapper.mm
+          # 3. Compile SDWrapper.mm
           $CLANG_CXX -c Sources/SDWrapper.mm \
             -o sd_build/SDWrapper.o \
             -arch arm64 \
@@ -88,7 +89,7 @@ jobs:
 
           STATIC_LIBS=$(find sd_build -name "*.a" | tr '\n' ' ')
 
-          # Compile Swift + Link Frameworks
+          # 4. Compile Swift + Link Frameworks
           $SWIFTC Sources/MyApp.swift Sources/ContentView.swift sd_build/SDWrapper.o sd_build/sd_cli_bridge.o $EXTRA_OBJS \
             $STATIC_LIBS \
             -import-objc-header Sources/SDWrapper.h \
